@@ -15,7 +15,6 @@ import sys
 import os
 import argparse
 import json
-import shutil
 from typing import List
 
 # ensure repository root and notebook are on sys.path so imports work
@@ -80,6 +79,17 @@ def transform_mesh_to_scene(vertices, rotation, translation, scale):
         verts = torch.from_numpy(vertices).float()
     else:
         verts = vertices.float()
+    # Ensure verts lives on the same device as the pose tensors to avoid
+    # CUDA/CPU mismatches when doing matrix ops below. Determine device from
+    # rotation/translation/scale if available.
+    device = None
+    for t in (rotation, translation, scale):
+        if t is not None:
+            device = t.device
+            break
+    if device is None:
+        device = torch.device("cpu")
+    verts = verts.to(device)
     
     # Handle quaternion shape
     if rotation.dim() == 2:
@@ -121,7 +131,26 @@ def transform_mesh_to_scene(vertices, rotation, translation, scale):
     verts_rotated = verts_scaled @ R.T
     verts_transformed = verts_rotated + trans.unsqueeze(0)
     
-    return verts_transformed.numpy()
+    # Ensure tensor is on CPU before converting to numpy to avoid
+    # the "can't convert cuda device tensor to numpy" error.
+    return verts_transformed.cpu().numpy()
+
+
+def extract_vertex_colors(mesh):
+    """Extract vertex colors from mesh, matching demo_with_colors.py behavior."""
+    vcols = None
+    if getattr(mesh, "vertex_attrs", None) is not None:
+        va = mesh.vertex_attrs
+        va_np = va.detach().cpu().numpy()
+        if va_np.shape[1] >= 3:
+            # Take first 3 channels as RGB and scale to 0-255 if needed
+            cols = va_np[:, :3].copy()
+            if cols.max() <= 1.001:
+                cols = (cols * 255).astype(np.uint8)
+            else:
+                cols = cols.astype(np.uint8)
+            vcols = cols
+    return vcols
 
 
 def main(argv: List[str]):
@@ -135,11 +164,6 @@ def main(argv: List[str]):
     p.add_argument("--device", type=str, default=None, help="cuda or cpu (default: auto detect)")
     p.add_argument("--overlap-thresh", type=float, default=0.7, help="IoU threshold to skip highly overlapping masks")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--bake-texture", action="store_true", help="Attempt to bake textures and save GLB/OBJ outputs")
-    p.add_argument("--use-vertex-color", action="store_true", help="Prefer vertex colors when present (fallback)")
-    p.add_argument("--render-reconstruction", action="store_true", help="Render reconstructed object back to an image for scale comparison")
-    p.add_argument("--render-out", type=str, default="recon_render.png", help="Path to save reconstruction render")
-    p.add_argument("--camera-distance", type=float, default=None, help="Optional camera distance (overrides auto) for reconstruction render")
     args = p.parse_args(argv)
 
     image_path = args.image
@@ -225,24 +249,7 @@ def main(argv: List[str]):
         bbox = bbox_from_mask(mask)
         print(f"[{j+1}/{len(accepted_idxs)}] Running reconstruction (area={area}, bbox={bbox})")
         try:
-            # If requested, try to run the pipeline with texture baking enabled.
-            if args.bake_texture:
-                try:
-                    image_rgba = inference.merge_mask_to_rgba(full_image, mask)
-                    out = inference._pipeline.run(
-                        image_rgba,
-                        None,
-                        seed=seed + j,
-                        with_mesh_postprocess=True,
-                        with_texture_baking=True,
-                        use_vertex_color=args.use_vertex_color,
-                        with_layout_postprocess=True,  # Enable layout optimization for better alignment
-                    )
-                except Exception as e:
-                    print("Texture baking failed (falling back to default inference):", e)
-                    out = inference(full_image, mask, seed=seed + j)
-            else:
-                out = inference(full_image, mask, seed=seed + j)
+            out = inference(full_image, mask, seed=seed + j)
         except Exception as e:
             print(f"Reconstruction failed for mask {j}: {e}")
             continue
@@ -275,35 +282,34 @@ def main(argv: List[str]):
             verts = m.vertices.detach().cpu().numpy()
             faces = m.faces.detach().cpu().numpy().astype(np.int64)
             
-            # Extract vertex colors if available
-            vcols = None
-            if getattr(m, "vertex_attrs", None) is not None:
-                va = m.vertex_attrs
-                va_np = va.detach().cpu().numpy()
-                if va_np.shape[1] >= 3:
-                    cols = va_np[:, :3].copy()
-                    if cols.max() <= 1.001:
-                        cols = (cols * 255).astype(np.uint8)
-                    else:
-                        cols = cols.astype(np.uint8)
-                    vcols = cols
+            # Extract vertex colors using the same method as demo_with_colors.py
+            vcols = extract_vertex_colors(m)
 
+            # Create trimesh with vertex colors
             tri = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
             if vcols is not None:
                 tri.visual.vertex_colors = vcols
+                print(f"Extracted vertex colors: shape={vcols.shape}, range=[{vcols.min()}, {vcols.max()}]")
             
-            # export PLY and OBJ (OBJ is useful for MuJoCo conversions)
+            # Export PLY, OBJ, and GLB (all formats support vertex colors)
             ply_out = os.path.join(meshes_outdir, f"object_{j:03d}.ply")
             obj_out = os.path.join(meshes_outdir, f"object_{j:03d}.obj")
+            glb_out = os.path.join(meshes_outdir, f"object_{j:03d}.glb")
+            
             tri.export(ply_out)
             try:
                 tri.export(obj_out)
                 meta["mesh_path_obj"] = obj_out
             except Exception:
-                # OBJ export may fail for some meshes; fall back to ply only
                 meta["mesh_path_obj"] = None
+            try:
+                tri.export(glb_out)
+                meta["glb_path"] = glb_out
+            except Exception:
+                meta["glb_path"] = None
+            
             meta["mesh_path"] = ply_out
-            print("Exported mesh", ply_out, ",", obj_out)
+            print(f"Exported mesh: {ply_out}, {obj_out}, {glb_out}")
             
             # Store mesh and pose for scene reconstruction
             if rotation is not None and translation is not None and scale is not None:
@@ -314,50 +320,6 @@ def main(argv: List[str]):
                     "scale": scale,
                     "vertex_colors": vcols,
                 })
-
-        # If the pipeline produced a GLB (textured) or user asked to bake textures, try to save it
-        if out is not None and args.bake_texture:
-            try:
-                glb_obj = out.get("glb", None)
-                if glb_obj is not None:
-                    glb_out = os.path.join(meshes_outdir, f"object_{j:03d}.glb")
-                    try:
-                        # many glb-like objects in this codebase expose `.export`
-                        glb_obj.export(glb_out)
-                        meta["glb_path"] = glb_out
-                        print("Saved GLB to", glb_out)
-                    except Exception:
-                        # fallback: try with trimesh (some glb objects are scenes)
-                        try:
-                            import trimesh
-
-                            scene = trimesh.util.wrap_as_scene(glb_obj)
-                            scene.export(glb_out)
-                            meta["glb_path"] = glb_out
-                            print("Saved GLB (via trimesh) to", glb_out)
-                        except Exception as e:
-                            print("Failed to save GLB:", e)
-                else:
-                    # no glb produced; try to save vertex-color PLY if requested
-                    if args.use_vertex_color and mesh_res and len(mesh_res) > 0:
-                        try:
-                            # attempt to find vertex color attributes (commonly under vertex_attrs)
-                            vcols = None
-                            if hasattr(m, "vertex_attrs") and isinstance(m.vertex_attrs, dict):
-                                for k in ["rgb", "vertex_color", "colors"]:
-                                    if k in m.vertex_attrs:
-                                        vcols = m.vertex_attrs[k].detach().cpu().numpy()
-                                        break
-                            if vcols is not None:
-                                tri = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=vcols, process=False)
-                                vply = os.path.join(meshes_outdir, f"object_{j:03d}_vcolors.ply")
-                                tri.export(vply)
-                                meta["mesh_vcolor_path"] = vply
-                                print("Saved vertex-color PLY to", vply)
-                        except Exception as e:
-                            print("Failed to export vertex-color PLY:", e)
-            except Exception as e:
-                print("Texture export step failed:", e)
 
         # try to free GPU memory if needed
         if device.startswith("cuda"):
@@ -382,7 +344,7 @@ def main(argv: List[str]):
             print("Reconstructing full scene mesh with original scale and orientation...")
             transformed_meshes = []
             
-            for i, scene_data in enumerate(scene_meshes):
+            for scene_data in scene_meshes:
                 mesh = scene_data["mesh"]
                 rotation = scene_data["rotation"]
                 translation = scene_data["translation"]
@@ -397,71 +359,35 @@ def main(argv: List[str]):
                     scale
                 )
                 
-                # Create new mesh with transformed vertices
-                if vcols is not None:
-                    scene_mesh = trimesh.Trimesh(
-                        vertices=verts_scene,
-                        faces=mesh.faces,
-                        vertex_colors=vcols,
-                        process=False
-                    )
-                else:
-                    scene_mesh = trimesh.Trimesh(
-                        vertices=verts_scene,
-                        faces=mesh.faces,
-                        process=False
-                    )
-                
+                # Create new mesh with transformed vertices and colors
+                scene_mesh = trimesh.Trimesh(
+                    vertices=verts_scene,
+                    faces=mesh.faces,
+                    vertex_colors=vcols if vcols is not None else None,
+                    process=False
+                )
                 transformed_meshes.append(scene_mesh)
             
             # Combine all transformed meshes into a single scene
-            if len(transformed_meshes) > 0:
-                scene_combined = trimesh.util.concatenate(transformed_meshes)
-                scene_ply = os.path.join(run_dir, "scene_all_objects.ply")
-                scene_obj = os.path.join(run_dir, "scene_all_objects.obj")
-                
-                scene_combined.export(scene_ply)
-                try:
-                    scene_combined.export(scene_obj)
-                    print("Saved full scene mesh:", scene_ply, scene_obj)
-                except Exception:
-                    print("Warning: failed to export scene OBJ")
-                    print("Saved full scene mesh:", scene_ply)
-            else:
-                print("No meshes available for scene reconstruction")
+            scene_combined = trimesh.util.concatenate(transformed_meshes)
+            scene_ply = os.path.join(run_dir, "scene_all_objects.ply")
+            scene_obj = os.path.join(run_dir, "scene_all_objects.obj")
+            scene_glb = os.path.join(run_dir, "scene_all_objects.glb")
+            
+            scene_combined.export(scene_ply)
+            try:
+                scene_combined.export(scene_obj)
+                print("Saved full scene mesh:", scene_ply, scene_obj)
+            except Exception:
+                print("Warning: failed to export scene OBJ")
+                print("Saved full scene mesh:", scene_ply)
+            try:
+                scene_combined.export(scene_glb)
+                print("Also saved scene GLB:", scene_glb)
+            except Exception:
+                pass
         else:
             print("No meshes with pose information available for scene reconstruction")
-
-        # Also try to assemble a combined mesh (OBJ/PLY) from per-object meshes (without transformation)
-        try:
-            import trimesh
-
-            per_obj_paths = [m.get("mesh_path") for m in metadata if m.get("mesh_path")]
-            meshes_to_concat = []
-            for pth in per_obj_paths:
-                try:
-                    tm = trimesh.load(pth, force='mesh')
-                    if tm is None:
-                        continue
-                    meshes_to_concat.append(tm)
-                except Exception:
-                    continue
-
-            if len(meshes_to_concat) > 0:
-                combined = trimesh.util.concatenate(meshes_to_concat)
-                all_ply = os.path.join(run_dir, "all_objects.ply")
-                all_obj = os.path.join(run_dir, "all_objects.obj")
-                combined.export(all_ply)
-                try:
-                    combined.export(all_obj)
-                except Exception:
-                    # OBJ export might fail; ignore but report
-                    print("Warning: failed to export combined OBJ")
-                print("Saved combined mesh (without transformation):", all_ply, all_obj)
-            else:
-                print("No per-object meshes available to combine into OBJ/PLY")
-        except Exception as e:
-            print("Failed to export combined mesh:", e)
     else:
         print("No successful outputs to merge.")
 
